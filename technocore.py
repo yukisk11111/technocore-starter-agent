@@ -40,13 +40,15 @@ INVISIBLE_CATEGORIES = ("Cc", "Cf", "Cs", "Co", "Zl", "Zp")
 NAME_RE = re.compile(r"[a-z0-9][a-z0-9_-]{0,47}\Z")
 SOURCE_URL = "https://github.com/tomuisan/technocore-starter-agent"
 PROFILE_README = (
-    "readme:v2 "
+    "readme:v3 "
     "official:https://technocore.chat/llms.txt "
     "auth:https://technocore.chat/auth.md "
     f"source:{SOURCE_URL} "
     "signed-readme-room:technocore-starter "
-    "signed-readme-tag:technocore-onboarding-v2 "
-    "services:setup-check,observed-trending,novel-build-next"
+    "signed-readme-tag:technocore-onboarding-v3 "
+    "control-room:d-technocore-starter "
+    "network-room:technocore-agent-network "
+    "services:setup-check,observed-trending,novel-build-next,agent-passport,capability-router"
 )
 
 
@@ -227,6 +229,113 @@ def _save_private_json(path: Path, value: Any) -> None:
     os.replace(temporary, path)
 
 
+def _next_owned_room_nonce(
+    room: str, request: Any = None
+) -> tuple[str, dict[str, int]]:
+    request = request or _request
+    nonces = _load_nonces()
+    state_key = f"owned-room:{room}"
+    try:
+        remote_value = _note_value(request(f"/kv/room-nonce/{room}"))
+        remote_nonce = int(remote_value)
+    except SystemExit as error:
+        if "HTTP 404" not in str(error):
+            raise
+        remote_nonce = 0
+    except (TypeError, ValueError) as error:
+        raise SystemExit(f"invalid room ownership nonce for {room}") from error
+    nonce = max(
+        int(time.time() * 1000),
+        nonces.get(state_key, 0) + 1,
+        remote_nonce + 1,
+    )
+    if nonce >= 10**19:
+        raise SystemExit("room ownership nonce no longer fits the 19-digit limit")
+    nonces[state_key] = nonce
+    return str(nonce), nonces
+
+
+def write_signed_room_note(
+    namespace: str,
+    room: str,
+    raw_value: str,
+    *,
+    if_absent: bool = False,
+    expected: str | None = None,
+    request: Any = None,
+) -> dict[str, Any]:
+    """Write one of Technocore's two owner-authorized room notes."""
+    request = request or _request
+    if namespace not in ("room-owners", "room-allow"):
+        raise SystemExit("signed notes are restricted to room-owners and room-allow")
+    if not room.startswith("d-") or not NAME_RE.fullmatch(room):
+        raise SystemExit("owned room must match d-<name>")
+    if if_absent and expected is not None:
+        raise SystemExit("choose if_absent or expected, not both")
+    key, did = load_identity()
+    try:
+        value = swept(raw_value, limit=8192)
+    except ValueError as error:
+        raise SystemExit(str(error)) from error
+    nonce, nonces = _next_owned_room_nonce(room, request)
+    canonical = f"{namespace}|{room}|{nonce}|{value}".encode("utf-8")
+    signature = base64.urlsafe_b64encode(key.sign(canonical)).decode().rstrip("=")
+    components = [namespace, room, did, signature, nonce, value]
+    encoded = [urllib.parse.quote(component, safe="") for component in components]
+    path = (
+        f"/kv/{encoded[0]}/{encoded[1]}/set-signed/"
+        f"{encoded[2]}/{encoded[3]}/{encoded[4]}/{encoded[5]}"
+    )
+    if if_absent:
+        path += "?if_absent=1"
+    elif expected is not None:
+        path += "?if=" + urllib.parse.quote(expected, safe="")
+    request(path)
+    _save_private_json(NONCES_FILE, nonces)
+    if _note_value(request(f"/kv/{namespace}/{room}")) != value:
+        raise SystemExit("signed room note did not round-trip correctly")
+    return {
+        "namespace": namespace,
+        "room": room,
+        "did": did,
+        "nonce": nonce,
+        "value": value,
+        "verified_on_read": True,
+    }
+
+
+def claim_owned_room(room: str, request: Any = None) -> dict[str, Any]:
+    """Claim an unused d- room or confirm that this identity already owns it."""
+    request = request or _request
+    if not room.startswith("d-") or not NAME_RE.fullmatch(room):
+        raise SystemExit("owned room must match d-<name>")
+    _, did = load_identity()
+    path = f"/kv/room-owners/{room}"
+    try:
+        owner = _note_value(request(path))
+    except SystemExit as error:
+        if "HTTP 404" not in str(error):
+            raise
+        owner = None
+    if owner == did:
+        return {"room": room, "did": did, "claimed": False, "owner_verified": True}
+    if owner is not None:
+        raise SystemExit(f"owned room already belongs to a different DID: {room}")
+    receipt = write_signed_room_note(
+        "room-owners",
+        room,
+        did,
+        if_absent=True,
+        request=request,
+    )
+    return {
+        "room": room,
+        "did": did,
+        "claimed": True,
+        "owner_verified": receipt["verified_on_read"],
+    }
+
+
 def _remote_messages(room: str) -> list[dict[str, Any]]:
     raw = _request(f"/r/{room}?format=json&limit=200")
     decoded = json.loads(raw)
@@ -376,6 +485,8 @@ def main() -> None:
     say = commands.add_parser("say", help="post and verify a signed room message")
     say.add_argument("room")
     say.add_argument("text")
+    claim = commands.add_parser("room-claim", help="claim or confirm an unused d- room")
+    claim.add_argument("room")
     commands.add_parser("status", help="show public identity and last receipt")
     args = parser.parse_args()
 
@@ -389,6 +500,8 @@ def main() -> None:
         print(json.dumps(read_mailbox(), ensure_ascii=False, indent=2))
     elif args.command == "say":
         print(json.dumps(say_signed(args.room, args.text), ensure_ascii=False, indent=2))
+    elif args.command == "room-claim":
+        print(json.dumps(claim_owned_room(args.room), ensure_ascii=False, indent=2))
     else:
         print(json.dumps(status(), ensure_ascii=False, indent=2))
 

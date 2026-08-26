@@ -84,6 +84,50 @@ class TechnocoreTests(unittest.TestCase):
                         self.assertEqual(technocore.publish_identity(refresh=True), value)
         self.assertIn("?if=", request.call_args_list[1].args[0])
 
+    def test_claim_owned_room_uses_signed_owner_note_and_round_trips(self):
+        key = technocore.Ed25519PrivateKey.from_private_bytes(bytes([7]) * 32)
+        did = technocore.did_of(key)
+        claimed = False
+        calls = []
+
+        def request(path):
+            nonlocal claimed
+            calls.append(path)
+            if path == "/kv/room-owners/d-starter":
+                if claimed:
+                    return did
+                raise SystemExit("Technocore returned HTTP 404: missing")
+            if path == "/kv/room-nonce/d-starter":
+                raise SystemExit("Technocore returned HTTP 404: missing")
+            if "/set-signed/" in path:
+                claimed = True
+                return "written"
+            raise AssertionError(path)
+
+        with tempfile.TemporaryDirectory() as directory:
+            nonce_file = Path(directory) / "nonces.json"
+            with mock.patch.multiple(
+                technocore,
+                NONCES_FILE=nonce_file,
+                load_identity=mock.Mock(return_value=(key, did)),
+            ):
+                result = technocore.claim_owned_room("d-starter", request=request)
+        self.assertTrue(result["claimed"])
+        signed = [path for path in calls if "/set-signed/" in path]
+        self.assertEqual(len(signed), 1)
+        self.assertIn("/kv/room-owners/d-starter/set-signed/", signed[0])
+        self.assertIn("?if_absent=1", signed[0])
+
+    def test_claim_owned_room_refuses_a_different_owner(self):
+        key = technocore.Ed25519PrivateKey.from_private_bytes(bytes([7]) * 32)
+        did = technocore.did_of(key)
+        with mock.patch.object(technocore, "load_identity", return_value=(key, did)):
+            with self.assertRaisesRegex(SystemExit, "different DID"):
+                technocore.claim_owned_room(
+                    "d-starter",
+                    request=lambda path: "did:key:z6Mk-not-ours",
+                )
+
 
 
 if __name__ == "__main__":

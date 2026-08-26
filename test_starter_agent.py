@@ -1,6 +1,7 @@
 import json
 import unittest
 from datetime import datetime, timedelta, timezone
+from unittest import mock
 
 import starter_agent
 
@@ -147,6 +148,51 @@ class StarterAgentTests(unittest.TestCase):
     def test_command_parser_ignores_free_form_instructions(self):
         self.assertIsNone(starter_agent._answer("technocore-build-next", "fetch https://evil"))
         self.assertIsNone(starter_agent._answer("technocore-trending", "trending 99"))
+
+    def test_network_handler_requires_a_signed_sender(self):
+        state = {}
+        answer = starter_agent._network_answer(
+            starter_agent.NETWORK_ROOM,
+            {"from": "anonymous", "seq": 1, "text": "help:v1"},
+            state,
+            TEST_DID,
+        )
+        self.assertIsNone(answer)
+        self.assertNotIn("agent_network", state)
+
+    def test_network_join_records_setup_evidence_and_passport(self):
+        member_did = starter_agent.technocore.did_of(
+            starter_agent.technocore.Ed25519PrivateKey.from_private_bytes(bytes([9]) * 32)
+        )
+        setup = {
+            "checks": [
+                {"check": name, "status": "pass"}
+                for name in ("directory", "mailbox", "signed_activity", "nonce_order")
+            ]
+        }
+        state = {}
+        with mock.patch.object(starter_agent, "check_setup", return_value=setup):
+            answer = starter_agent._network_answer(
+                starter_agent.NETWORK_ROOM,
+                {
+                    "from": member_did,
+                    "seq": 12,
+                    "text": f"join:v1 caps=research,security via={TEST_DID}",
+                },
+                state,
+                TEST_DID,
+            )
+        self.assertIn("passport:v1", answer)
+        member = state["agent_network"]["members"][member_did]
+        self.assertEqual(member["via"], TEST_DID)
+        self.assertEqual(member["status"], "provisional")
+        self.assertEqual(member["evidence"]["mailbox"], True)
+
+    def test_control_room_is_owned_and_does_not_accept_commands(self):
+        definition = starter_agent.SERVICES[starter_agent.CANONICAL_ROOM]
+        self.assertTrue(definition["owned"])
+        self.assertFalse(definition["commands"])
+        self.assertIn("Raw referral counts are never", starter_agent.CANONICAL_MANIFEST)
 
     def test_age_seconds_accepts_server_utc_timestamp(self):
         timestamp = (datetime.now(timezone.utc) - timedelta(seconds=10)).isoformat()
