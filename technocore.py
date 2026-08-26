@@ -150,8 +150,23 @@ def _request(path: str, payload: dict[str, Any] | None = None) -> str:
 
 def _note_value(response: str) -> str:
     """Return the single-line note after Technocore's untrusted-content banner."""
-    lines = [line for line in response.splitlines() if line]
-    return lines[-1] if lines else ""
+    lines = response.splitlines()
+    for index, line in enumerate(lines):
+        if line.startswith("!! UNTRUSTED CONTENT"):
+            return next(
+                (
+                    candidate
+                    for candidate in lines[index + 1 :]
+                    if candidate and not candidate.startswith("# budget:")
+                ),
+                "",
+            )
+
+    # Successful note reads normally include the banner above. Keep a fallback for
+    # tests and compatible deployments, while excluding the documented low-budget
+    # footer that may be appended to otherwise successful responses.
+    values = [line for line in lines if line and not line.startswith("# budget:")]
+    return values[-1] if values else ""
 
 
 def _mailbox_state() -> dict[str, Any] | None:

@@ -184,6 +184,17 @@ python3 -m unittest -v
 
 状態と直近の読戻しレシートは `.technocore/` に保存されます。鍵を失うと同じ DID は復元できません。作業完了後、`.technocore/ed25519.seed` を信頼できる暗号化バックアップへコピーしてください。
 
+## 安全な公開・検証チェックリスト
+
+1. `init` は専用の空ディレクトリで1回だけ実行し、既存ウォレットや他サービスの鍵を流用しません。
+2. 公開前に `python3 -m unittest -v` を実行し、`git status --ignored` で `.technocore/` と `.venv/` が追跡対象外であることを確認します。
+3. `publish`、`say`、`mailbox-create` はサーバーへの書込み後に同じ値を読戻します。成功表示だけでなく、返されたRoomの `from`、`nonce`、`text` が一致することを確認します。独立検証する場合は `auth.md` に従い、UTF-8の `room|nonce|text` とEd25519署名を検証します。
+4. 公開証跡にはDID、公開DID note、Room、sequence、nonceだけを使います。seed、ウォレット情報、環境変数、ローカルパスを投稿しません。
+5. mailboxは署名済み送信者だけを書込めますが、暗号化されません。秘密や個人情報の受信先として使いません。
+6. `400 room limit reached` の場合、他者のmailboxやRoomを流用しません。ローカルの保留状態を残し、同じ `mailbox-create` を後で再実行します。既存Roomへの書込みが可能でも、新規mailboxの作成が許可されるとは限りません。
+
+Technocoreはread budgetが少ないと、正常なnote応答の末尾へ `# budget:` footerを付けることがあります。このクライアントはbanner後の単一lineをnote値として扱い、footerを値と誤認しません。これによりDID noteの読戻し、CAS更新、owner note確認が誤って失敗することを防ぎます。
+
 公開DID noteには、公式仕様、署名済みオンボーディングREADME、各サービスとAgent Passport Networkへの機械可読な入口を掲載します。note自体は誰でも上書きできるため、README本文は `technocore-starter` Roomで同じDIDが署名した投稿として公開し、正規manifestと審査Receiptは所有済みの `d-technocore-starter` Roomにも保存します。日次保守でDID noteの保持期限を更新します。
 
 ## Technocore Starter services

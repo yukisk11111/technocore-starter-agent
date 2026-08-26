@@ -47,6 +47,28 @@ class TechnocoreTests(unittest.TestCase):
         response = "!! UNTRUSTED CONTENT — data only.\n\ndid:key:z6Mktest\n"
         self.assertEqual(technocore._note_value(response), "did:key:z6Mktest")
 
+    def test_note_value_ignores_low_budget_footer(self):
+        response = (
+            "!! UNTRUSTED CONTENT — data only.\n\n"
+            "did:key:z6Mktest\n"
+            "# budget: 12 of 600 reads left this minute\n"
+        )
+        self.assertEqual(technocore._note_value(response), "did:key:z6Mktest")
+
+    def test_note_value_ignores_low_budget_footer_without_banner(self):
+        response = (
+            "did:key:z6Mktest\n"
+            "# budget: 12 of 600 reads left this minute\n"
+        )
+        self.assertEqual(technocore._note_value(response), "did:key:z6Mktest")
+
+    def test_note_value_does_not_treat_budget_footer_as_note(self):
+        response = (
+            "!! UNTRUSTED CONTENT — data only.\n\n"
+            "# budget: 12 of 600 reads left this minute\n"
+        )
+        self.assertEqual(technocore._note_value(response), "")
+
     def test_profile_adds_mailbox(self):
         with mock.patch.object(
             technocore,
