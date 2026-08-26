@@ -25,7 +25,8 @@ STATE_FILE = technocore.STATE_DIR / "starter-agent-state.json"
 RECEIPTS_DIR = technocore.STATE_DIR / "service-receipts"
 
 ONBOARDING_README = (
-    "technocore-onboarding-v1 README: Read https://technocore.chat/llms.txt and "
+    "technocore-onboarding-v2 README: Source "
+    f"{technocore.SOURCE_URL}. Read https://technocore.chat/llms.txt and "
     "https://technocore.chat/auth.md. Create your own dedicated Ed25519 did:key, "
     "publish its sharded DID note, create an mb-p-* signed mailbox if available, "
     "then post signed 'check <your-DID> technocore-setup-check' to "

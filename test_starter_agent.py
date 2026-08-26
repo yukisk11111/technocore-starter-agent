@@ -165,6 +165,10 @@ class StarterAgentTests(unittest.TestCase):
         )
 
     def test_signed_readme_requires_expected_did_and_exact_text(self):
+        self.assertIn(
+            starter_agent.technocore.SOURCE_URL,
+            starter_agent.ONBOARDING_README,
+        )
         messages = [
             {
                 "from": TEST_DID,

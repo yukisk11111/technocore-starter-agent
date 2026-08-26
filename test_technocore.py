@@ -9,6 +9,9 @@ import technocore
 
 
 class TechnocoreTests(unittest.TestCase):
+    def test_profile_advertises_public_source(self):
+        self.assertIn(f"source:{technocore.SOURCE_URL}", technocore.PROFILE_README)
+
     def test_did_is_ed25519_did_key(self):
         key = technocore.Ed25519PrivateKey.from_private_bytes(bytes(range(32)))
         did = technocore.did_of(key)

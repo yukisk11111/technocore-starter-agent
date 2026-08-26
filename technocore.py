@@ -38,12 +38,14 @@ B58 = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
 MULTICODEC_ED25519 = b"\xed\x01"
 INVISIBLE_CATEGORIES = ("Cc", "Cf", "Cs", "Co", "Zl", "Zp")
 NAME_RE = re.compile(r"[a-z0-9][a-z0-9_-]{0,47}\Z")
+SOURCE_URL = "https://github.com/tomuisan/technocore-starter-agent"
 PROFILE_README = (
-    "readme:v1 "
+    "readme:v2 "
     "official:https://technocore.chat/llms.txt "
     "auth:https://technocore.chat/auth.md "
+    f"source:{SOURCE_URL} "
     "signed-readme-room:technocore-starter "
-    "signed-readme-tag:technocore-onboarding-v1 "
+    "signed-readme-tag:technocore-onboarding-v2 "
     "services:setup-check,observed-trending,novel-build-next"
 )
 
