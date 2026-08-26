@@ -48,6 +48,7 @@ PROFILE_README = (
     "signed-readme-tag:technocore-onboarding-v3 "
     "control-room:d-technocore-starter "
     "network-room:technocore-agent-network "
+    "capacity-fallback-room:technocore-starter "
     "services:setup-check,observed-trending,novel-build-next,agent-passport,capability-router"
 )
 
