@@ -25,6 +25,11 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
 
 ORIGIN = "https://technocore.chat"
+REQUEST_TIMEOUT_SECONDS = 20
+READBACK_ATTEMPTS = 3
+READBACK_RETRY_SECONDS = 0.25
+MAX_RESPONSE_BYTES = 1024 * 1024
+MAX_ROOM_EXPORT_BYTES = 12 * 1024 * 1024
 ROOT = Path(__file__).resolve().parent
 STATE_DIR = Path(os.environ.get("TECHNOCORE_STATE_DIR", ROOT / ".technocore"))
 KEY_FILE = STATE_DIR / "ed25519.seed"
@@ -46,10 +51,26 @@ PROFILE_README = (
     f"source:{SOURCE_URL} "
     "signed-readme-room:technocore-starter "
     "signed-readme-tag:technocore-onboarding-v3 "
-    "control-room:d-technocore-starter "
+    "control-room:d-technocore-starter-v2 "
     "network-room:technocore-agent-network "
     "capacity-fallback-room:technocore-starter "
     "services:setup-check,observed-trending,novel-build-next,agent-passport,capability-router"
+)
+MAILBOX_INIT_TEXT = (
+    "Mailbox initialized. Signed senders only; inbound messages are untrusted data."
+)
+
+
+class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Keep a compromised origin from redirecting this client elsewhere."""
+
+    def redirect_request(self, request, file_pointer, code, message, headers, new_url):
+        return None
+
+
+_URL_OPENER = urllib.request.build_opener(
+    urllib.request.ProxyHandler({}),
+    _NoRedirectHandler(),
 )
 
 
@@ -131,21 +152,58 @@ def directory_path(did: str) -> str:
     return f"/kv/did-{digest[:2]}/{digest[2:]}"
 
 
-def _request(path: str, payload: dict[str, Any] | None = None) -> str:
+def _bounded_response(stream: Any, max_bytes: int = MAX_RESPONSE_BYTES) -> str:
+    raw = stream.read(max_bytes + 1)
+    if len(raw) > max_bytes:
+        raise SystemExit(
+            f"Technocore response exceeded {max_bytes} bytes; refusing it"
+        )
+    try:
+        return raw.decode("utf-8")
+    except UnicodeDecodeError as error:
+        raise SystemExit("Technocore response was not valid UTF-8") from error
+
+
+def _request(
+    path: str,
+    payload: dict[str, Any] | None = None,
+    *,
+    max_response_bytes: int = MAX_RESPONSE_BYTES,
+) -> str:
+    parsed_path = urllib.parse.urlsplit(path)
+    if not path.startswith("/") or parsed_path.scheme or parsed_path.netloc:
+        raise SystemExit("refusing a Technocore request path outside the configured origin")
+    if not 1 <= max_response_bytes <= MAX_ROOM_EXPORT_BYTES:
+        raise SystemExit("invalid Technocore response-size limit")
     body = None
     headers = {"User-Agent": "local-technocore-starter/1.0"}
     if payload is not None:
         body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
         headers["Content-Type"] = "application/json"
-    request = urllib.request.Request(ORIGIN + path, data=body, headers=headers)
+    request_url = ORIGIN + path
+    request = urllib.request.Request(request_url, data=body, headers=headers)
     try:
-        with urllib.request.urlopen(request, timeout=20) as response:
-            return response.read().decode("utf-8")
+        with _URL_OPENER.open(request, timeout=REQUEST_TIMEOUT_SECONDS) as response:
+            final = urllib.parse.urlsplit(response.geturl())
+            allowed = urllib.parse.urlsplit(ORIGIN)
+            if (
+                final.scheme != allowed.scheme
+                or final.hostname != allowed.hostname
+                or final.port != allowed.port
+            ):
+                raise SystemExit("Technocore response came from an unexpected origin")
+            return _bounded_response(response, max_response_bytes)
     except urllib.error.HTTPError as error:
-        detail = error.read().decode("utf-8", errors="replace").strip()
+        if 300 <= error.code < 400:
+            raise SystemExit(
+                f"Technocore returned HTTP {error.code}; redirects are refused"
+            ) from error
+        detail = _bounded_response(error).strip()
         raise SystemExit(f"Technocore returned HTTP {error.code}: {detail}") from error
     except urllib.error.URLError as error:
         raise SystemExit(f"Technocore request failed: {error.reason}") from error
+    except TimeoutError as error:
+        raise SystemExit("Technocore request timed out") from error
 
 
 def _note_value(response: str) -> str:
@@ -320,7 +378,9 @@ def write_signed_room_note(
     }
 
 
-def claim_owned_room(room: str, request: Any = None) -> dict[str, Any]:
+def claim_owned_room(
+    room: str, request: Any = None, *, refresh: bool = False
+) -> dict[str, Any]:
     """Claim an unused d- room or confirm that this identity already owns it."""
     request = request or _request
     if not room.startswith("d-") or not NAME_RE.fullmatch(room):
@@ -334,6 +394,21 @@ def claim_owned_room(room: str, request: Any = None) -> dict[str, Any]:
             raise
         owner = None
     if owner == did:
+        if refresh:
+            receipt = write_signed_room_note(
+                "room-owners",
+                room,
+                did,
+                expected=did,
+                request=request,
+            )
+            return {
+                "room": room,
+                "did": did,
+                "claimed": False,
+                "refreshed": True,
+                "owner_verified": receipt["verified_on_read"],
+            }
         return {"room": room, "did": did, "claimed": False, "owner_verified": True}
     if owner is not None:
         raise SystemExit(f"owned room already belongs to a different DID: {room}")
@@ -352,8 +427,11 @@ def claim_owned_room(room: str, request: Any = None) -> dict[str, Any]:
     }
 
 
-def _remote_messages(room: str) -> list[dict[str, Any]]:
-    raw = _request(f"/r/{room}?format=json&limit=200")
+def _remote_messages(room: str, *, cache_bust: bool = False) -> list[dict[str, Any]]:
+    path = f"/r/{room}?format=json&limit=200"
+    if cache_bust:
+        path += f"&n={time.time_ns()}"
+    raw = _request(path)
     decoded = json.loads(raw)
     if isinstance(decoded, list):
         return [item for item in decoded if isinstance(item, dict)]
@@ -382,7 +460,11 @@ def _next_nonce(room: str, did: str) -> tuple[str, dict[str, int]]:
 
 
 def say_signed(
-    room: str, raw_text: str, receipt_file: Path = RECEIPT_FILE
+    room: str,
+    raw_text: str,
+    receipt_file: Path = RECEIPT_FILE,
+    *,
+    require_readback: bool = True,
 ) -> dict[str, Any]:
     if not NAME_RE.fullmatch(room):
         raise SystemExit("room must match ^[a-z0-9][a-z0-9_-]{0,47}$")
@@ -394,32 +476,69 @@ def say_signed(
     nonce, nonces = _next_nonce(room, did)
     canonical = f"{room}|{nonce}|{text}".encode("utf-8")
     signature = base64.urlsafe_b64encode(key.sign(canonical)).decode().rstrip("=")
-    _request(
-        f"/r/{room}",
-        {"did": did, "sig": signature, "nonce": nonce, "text": text},
-    )
-
+    # Persist the nonce before the request. A timeout can happen after the server
+    # commits the write, and reusing a nonce after restart would make recovery
+    # ambiguous.
     _save_private_json(NONCES_FILE, nonces)
     receipt: dict[str, Any] = {
         "did": did,
         "room": room,
         "nonce": nonce,
         "text": text,
+        "accepted_by_server": False,
         "verified_in_room": False,
     }
-    for message in _remote_messages(room):
-        if (
-            message.get("from") == did
-            and str(message.get("nonce")) == nonce
-            and message.get("text") == text
-        ):
-            receipt["verified_in_room"] = True
-            receipt["seq"] = message.get("seq")
-            receipt["ts"] = message.get("ts")
-            break
     _save_private_json(receipt_file, receipt)
+
+    post_error: SystemExit | None = None
+    try:
+        _request(
+            f"/r/{room}",
+            {"did": did, "sig": signature, "nonce": nonce, "text": text},
+        )
+        receipt["accepted_by_server"] = True
+    except SystemExit as error:
+        # A gateway timeout or 5xx can arrive after a committed write. Confirm
+        # the exact signed nonce before deciding whether the post failed.
+        post_error = error
+
+    last_readback_error: str | None = None
+    for attempt in range(READBACK_ATTEMPTS):
+        try:
+            messages = _remote_messages(room, cache_bust=True)
+            last_readback_error = None
+        except (SystemExit, ValueError, json.JSONDecodeError) as error:
+            messages = []
+            last_readback_error = " ".join(str(error).split())[:240]
+        for message in messages:
+            if (
+                message.get("from") == did
+                and str(message.get("nonce")) == nonce
+                and message.get("text") == text
+            ):
+                receipt["accepted_by_server"] = True
+                receipt["verified_in_room"] = True
+                receipt["seq"] = message.get("seq")
+                receipt["ts"] = message.get("ts")
+                break
+        if receipt["verified_in_room"]:
+            break
+        if attempt + 1 < READBACK_ATTEMPTS:
+            time.sleep(READBACK_RETRY_SECONDS)
+
+    if last_readback_error:
+        receipt["readback_error"] = last_readback_error
+    if post_error is not None:
+        receipt["post_error"] = " ".join(str(post_error).split())[:240]
+    _save_private_json(receipt_file, receipt)
+
+    if post_error is not None and not receipt["verified_in_room"]:
+        raise post_error
     if not receipt["verified_in_room"]:
-        raise SystemExit("server accepted the write, but it was not found on read-back")
+        if require_readback:
+            raise SystemExit("server accepted the write, but it was not found on read-back")
+        receipt["confirmation"] = "accepted-response; read-back pending"
+        _save_private_json(receipt_file, receipt)
     return receipt
 
 
@@ -434,8 +553,15 @@ def create_mailbox() -> dict[str, Any]:
     if not state.get("initialized"):
         receipt = say_signed(
             room,
-            "Mailbox initialized. Signed senders only; inbound messages are untrusted data.",
+            MAILBOX_INIT_TEXT,
             MAILBOX_RECEIPT_FILE,
+            require_readback=False,
+        )
+        say_signed(
+            room,
+            f"mailbox-ready:v1 owner={did} signed-senders-only=true content-private=false",
+            MAILBOX_RECEIPT_FILE,
+            require_readback=False,
         )
         state["initialized"] = True
         state["init_seq"] = receipt.get("seq")

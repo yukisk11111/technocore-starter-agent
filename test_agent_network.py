@@ -1,4 +1,5 @@
 import unittest
+from unittest import mock
 
 import agent_network
 import technocore
@@ -97,6 +98,19 @@ class AgentNetworkTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "5 unclaimed"):
             agent_network.invite_member(network, parent, did(7), 7, now=T0)
 
+    def test_network_state_has_hard_capacity_limits(self):
+        network = fresh_network()
+        with mock.patch.object(agent_network, "MAX_MEMBERS", 0):
+            with self.assertRaisesRegex(ValueError, "member capacity"):
+                join(network, did(1))
+
+        parent = did(2)
+        parent_member = join(network, parent)
+        parent_member["status"] = "verified"
+        with mock.patch.object(agent_network, "MAX_INVITATIONS", 0):
+            with self.assertRaisesRegex(ValueError, "invitation capacity"):
+                agent_network.invite_member(network, parent, did(3), 3, now=T0)
+
     def test_referral_parent_is_immutable_but_may_be_omitted_on_update(self):
         network = fresh_network()
         actor = did(1)
@@ -164,6 +178,35 @@ class AgentNetworkTests(unittest.TestCase):
         agent_network.refresh_statuses(network, SERVICE_DID, now=T1)
         self.assertEqual(member["status"], "provisional")
 
+    def test_member_status_names_concrete_setup_gaps(self):
+        network = fresh_network()
+        actor = did(1)
+        member = join(network, actor)
+        member["evidence"]["directory"] = False
+        member["evidence"]["mailbox"] = False
+        response = agent_network.member_status(
+            network, actor, SERVICE_DID, now=T0
+        )
+        self.assertIn("gaps=public-setup,accepted-artifact,24h-age", response)
+        self.assertIn("setup_missing=directory,mailbox", response)
+
+    def test_live_refresh_does_not_forget_a_buried_signed_join(self):
+        network = fresh_network()
+        actor = did(1)
+        member = join(network, actor)
+        member["evidence"]["signed_join"] = False
+        member["evidence"]["nonce_order"] = False
+        bounded_result = {
+            "checks": [
+                {"check": "directory", "status": "pass"},
+                {"check": "mailbox", "status": "pass"},
+                {"check": "signed_activity", "status": "warn"},
+            ]
+        }
+        refreshed = agent_network.refreshed_setup_evidence(member, bounded_result)
+        self.assertTrue(refreshed["signed_join"])
+        self.assertTrue(refreshed["nonce_order"])
+
     def test_artifact_requires_actor_signature_task_prefix_and_useful_length(self):
         network = fresh_network()
         actor = did(1)
@@ -195,6 +238,22 @@ class AgentNetworkTests(unittest.TestCase):
                 },
                 now=T1,
             )
+
+    def test_new_artifact_is_rejected_at_capacity(self):
+        network = fresh_network()
+        actor = did(1)
+        member = join(network, actor)
+        task_id = member["task"]["id"]
+        message = {
+            "from": actor,
+            "seq": 9,
+            "text": f"contribution:v1 task={task_id} summary=" + "measured result " * 4,
+        }
+        with mock.patch.object(agent_network, "MAX_ARTIFACTS", 0):
+            with self.assertRaisesRegex(ValueError, "artifact capacity"):
+                agent_network.submit_artifact(
+                    network, actor, task_id, "research-room", 9, message, now=T1
+                )
 
     def test_private_or_ephemeral_artifacts_are_rejected(self):
         network = fresh_network()

@@ -26,7 +26,7 @@ awk -v begin="$begin" -v end="$end" '
 {
   printf '\n%s\n' "$begin"
   printf '* * * * * %s\n' "$once_runner"
-  printf '23 3 * * * %s\n' "$maintenance_runner"
+  printf '23 */6 * * * %s\n' "$maintenance_runner"
   printf '%s\n' "$end"
 } >>"$clean"
 

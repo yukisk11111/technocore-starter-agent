@@ -9,6 +9,36 @@ import technocore
 
 
 class TechnocoreTests(unittest.TestCase):
+    def test_request_rejects_paths_outside_the_configured_origin(self):
+        with self.assertRaisesRegex(SystemExit, "outside the configured origin"):
+            technocore._request("//169.254.169.254/latest")
+
+    def test_request_rejects_an_unexpected_final_origin(self):
+        response = mock.MagicMock()
+        response.__enter__.return_value = response
+        response.geturl.return_value = "https://example.invalid/redirected"
+        with mock.patch.object(technocore._URL_OPENER, "open", return_value=response):
+            with self.assertRaisesRegex(SystemExit, "unexpected origin"):
+                technocore._request("/healthz")
+
+    def test_request_rejects_oversized_responses(self):
+        response = mock.MagicMock()
+        response.__enter__.return_value = response
+        response.geturl.return_value = technocore.ORIGIN + "/healthz"
+        response.read.return_value = b"x" * (technocore.MAX_RESPONSE_BYTES + 1)
+        with mock.patch.object(technocore._URL_OPENER, "open", return_value=response):
+            with self.assertRaisesRegex(SystemExit, "exceeded"):
+                technocore._request("/healthz")
+
+    def test_request_converts_socket_timeout_to_controlled_error(self):
+        with mock.patch.object(
+            technocore._URL_OPENER,
+            "open",
+            side_effect=TimeoutError("read timed out"),
+        ):
+            with self.assertRaisesRegex(SystemExit, "request timed out"):
+                technocore._request("/healthz")
+
     def test_profile_advertises_public_source(self):
         self.assertIn(f"source:{technocore.SOURCE_URL}", technocore.PROFILE_README)
 
@@ -149,6 +179,60 @@ class TechnocoreTests(unittest.TestCase):
                     "d-starter",
                     request=lambda path: "did:key:z6Mk-not-ours",
                 )
+
+    def test_claim_owned_room_refreshes_existing_owner_note(self):
+        key = technocore.Ed25519PrivateKey.from_private_bytes(bytes([7]) * 32)
+        did = technocore.did_of(key)
+        with (
+            mock.patch.object(technocore, "load_identity", return_value=(key, did)),
+            mock.patch.object(
+                technocore,
+                "write_signed_room_note",
+                return_value={"verified_on_read": True},
+            ) as write_note,
+        ):
+            result = technocore.claim_owned_room(
+                "d-starter", request=lambda path: did, refresh=True
+            )
+        self.assertTrue(result["refreshed"])
+        write_note.assert_called_once_with(
+            "room-owners",
+            "d-starter",
+            did,
+            expected=did,
+            request=mock.ANY,
+        )
+
+    def test_tolerant_signed_write_accepts_2xx_when_readback_is_stale(self):
+        key = technocore.Ed25519PrivateKey.from_private_bytes(bytes([7]) * 32)
+        did = technocore.did_of(key)
+        with tempfile.TemporaryDirectory() as directory:
+            receipt_file = Path(directory) / "receipt.json"
+            with (
+                mock.patch.object(technocore, "load_identity", return_value=(key, did)),
+                mock.patch.object(
+                    technocore, "_next_nonce", return_value=("123", {"d-starter": 123})
+                ),
+                mock.patch.object(technocore, "_save_private_json"),
+                mock.patch.object(technocore, "_request", return_value="ok"),
+                mock.patch.object(
+                    technocore, "_remote_messages", return_value=[]
+                ) as remote_messages,
+                mock.patch.object(technocore.time, "sleep"),
+            ):
+                result = technocore.say_signed(
+                    "d-starter",
+                    "bootstrap",
+                    receipt_file,
+                    require_readback=False,
+                )
+        self.assertTrue(result["accepted_by_server"])
+        self.assertFalse(result["verified_in_room"])
+        self.assertIn("read-back pending", result["confirmation"])
+        self.assertEqual(remote_messages.call_count, technocore.READBACK_ATTEMPTS)
+        self.assertTrue(
+            all(call.kwargs == {"cache_bust": True} for call in remote_messages.call_args_list)
+        )
 
 
 

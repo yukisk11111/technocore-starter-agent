@@ -20,6 +20,10 @@ REFERRAL_WINDOW_SECONDS = 7 * 24 * 60 * 60
 AUTO_REFERRAL_CREDITS_PER_WINDOW = 3
 INVITE_TTL_SECONDS = 7 * 24 * 60 * 60
 MAX_OPEN_INVITES = 5
+MAX_MEMBERS = 512
+MAX_ARTIFACTS = 1024
+MAX_INVITATIONS = 1024
+MAX_REFERRAL_EDGES = 512
 ROUTE_COOLDOWN_SECONDS = 60 * 60
 MIN_CONTRIBUTION_SUMMARY_CHARS = 40
 
@@ -130,12 +134,42 @@ def setup_evidence(result: dict[str, Any]) -> dict[str, bool]:
     }
 
 
-def _setup_ready(member: dict[str, Any]) -> bool:
-    evidence = member.get("evidence", {})
-    return all(
-        evidence.get(name) is True
-        for name in ("directory", "mailbox", "signed_join", "nonce_order")
+def refreshed_setup_evidence(
+    member: dict[str, Any], result: dict[str, Any]
+) -> dict[str, bool]:
+    """Merge a live check without losing recorded signed-join evidence.
+
+    Room reads are bounded to the newest 200 messages, so an old signed join can
+    legitimately disappear from a later check. A member record can only be
+    created from a server-attributed signed join, and one observed nonce is
+    trivially ordered. Directory and mailbox evidence remain live/revocable.
+    """
+    evidence = setup_evidence(result)
+    prior = member.get("evidence", {})
+    recorded_join = (
+        DID_RE.fullmatch(str(member.get("did", ""))) is not None
+        and isinstance(member.get("join_request_seq"), int)
+        and int(member["join_request_seq"]) > 0
     )
+    if recorded_join or prior.get("signed_join") is True:
+        evidence["signed_join"] = True
+    if recorded_join or prior.get("nonce_order") is True:
+        evidence["nonce_order"] = True
+    return evidence
+
+
+def _setup_ready(member: dict[str, Any]) -> bool:
+    return not setup_gaps(member)
+
+
+def setup_gaps(member: dict[str, Any]) -> list[str]:
+    """Return the concrete public-setup evidence still missing for a member."""
+    evidence = member.get("evidence", {})
+    return [
+        name
+        for name in ("directory", "mailbox", "signed_join", "nonce_order")
+        if evidence.get(name) is not True
+    ]
 
 
 def _passport_id(did: str) -> str:
@@ -199,6 +233,16 @@ def invite_member(
     now: str | None = None,
 ) -> str:
     now = now or now_iso()
+    for invited_child, invitation in list(network["invites"].items()):
+        if not isinstance(invitation, dict) or invitation.get("status") != "open":
+            del network["invites"][invited_child]
+            continue
+        try:
+            expired = _age_seconds(str(invitation["created_at"]), now) > INVITE_TTL_SECONDS
+        except (KeyError, TypeError, ValueError):
+            expired = True
+        if expired:
+            del network["invites"][invited_child]
     parent_member = network["members"].get(parent)
     if not isinstance(parent_member, dict) or parent_member.get("status") != "verified":
         raise ValueError("only a Verified passport may issue referral invitations")
@@ -220,7 +264,6 @@ def invite_member(
                     f"invite:v1 parent={parent} child={child} status=open expires=7d "
                     "single-child attribution; child must join with this parent DID."
                 )
-            current["status"] = "expired"
     open_invites = 0
     for invitation in network["invites"].values():
         if not isinstance(invitation, dict) or invitation.get("parent") != parent:
@@ -234,6 +277,8 @@ def invite_member(
             continue
     if open_invites >= MAX_OPEN_INVITES:
         raise ValueError("referrer already has 5 unclaimed invitations")
+    if len(network["invites"]) >= MAX_INVITATIONS:
+        raise ValueError("agent network invitation capacity reached")
     network["invites"][child] = {
         "parent": parent,
         "child": child,
@@ -275,6 +320,9 @@ def register_join(
         existing["evidence_checked_at"] = now
         existing["updated_at"] = now
         return existing, False
+
+    if len(members) >= MAX_MEMBERS:
+        raise ValueError("agent network member capacity reached")
 
     if via == actor:
         raise ValueError("self-referral is not allowed")
@@ -436,6 +484,8 @@ def submit_artifact(
     prior = network["artifacts"].get(artifact_key)
     if prior and prior != task_id:
         raise ValueError("artifact sequence is already attached to another task")
+    if prior is None and len(network["artifacts"]) >= MAX_ARTIFACTS:
+        raise ValueError("agent network artifact capacity reached")
     summary = validate_artifact_message(member, room, seq, message)
     network["artifacts"][artifact_key] = task_id
     task.update(
@@ -505,6 +555,8 @@ def _create_or_update_referral_edge(
                 existing["status"] = "credited-root" if parent == service_did else "credited"
                 existing["decided_at"] = now
         return existing
+    if len(network["referral_edges"]) >= MAX_REFERRAL_EDGES:
+        raise ValueError("agent network referral capacity reached")
     if parent == service_did:
         status = "credited-root"
         reason = "bootstrap-source-attribution"
@@ -639,6 +691,7 @@ def member_status(
     credited = sum(edge.get("status") == "credited" for edge in edges)
     pending = sum(edge.get("status") in ("pending-parent", "manual-review") for edge in edges)
     gaps = _verification_gaps(member, now)
+    missing_setup = setup_gaps(member)
     subscription = member.get("subscription")
     subscribed = (
         f"{','.join(subscription['topics'])}@{subscription['max_per_day']}/day"
@@ -648,6 +701,7 @@ def member_status(
     return (
         f"passport-status:v1 id={member['passport_id']} member={actor} "
         f"status={member['status']} gaps={','.join(gaps) or 'none'} "
+        f"setup_missing={','.join(missing_setup) or 'none'} "
         f"caps={','.join(member['caps'])} subscription={subscribed} "
         f"verified_referrals={credited} pending_referrals={pending}; "
         f"share transparently as via={actor}. Raw referrals are not ranking signals."
